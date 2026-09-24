@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Control por Voz - LED</title>
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body {
+      background-color: #121212;
+      color: #fff;
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      text-align: center;
+      user-select: none;
+    }
+    h1 { font-size: 1.3rem; margin-bottom: 4px; }
+    .sub { color: #888; font-size: 0.85rem; margin-bottom: 24px; }
+    .btn {
+      background-color: #007BFF;
+      color: white;
+      border: none;
+      padding: 16px 32px;
+      font-size: 1.1rem;
+      font-weight: bold;
+      border-radius: 12px;
+      margin: 8px;
+      cursor: pointer;
+    }
+    .btn-connect { background-color: #28a745; }
+    .btn-connect.connected { background-color: #dc3545; }
+    .btn-mic {
+      width: 140px;
+      height: 140px;
+      border-radius: 50%;
+      background-color: #333;
+      font-size: 3rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 24px auto;
+      transition: background-color 0.2s, transform 0.2s;
+    }
+    .btn-mic.listening {
+      background-color: #dc3545;
+      transform: scale(1.08);
+      box-shadow: 0 0 0 8px rgba(220, 53, 69, 0.25);
+    }
+    .btn-mic:disabled { opacity: 0.4; }
+    #status { color: #aaa; margin-top: 6px; font-size: 0.95rem; min-height: 20px; }
+    #transcript {
+      margin-top: 20px;
+      font-size: 1.4rem;
+      font-weight: bold;
+      min-height: 34px;
+      color: #38bdf8;
+    }
+    #ledState {
+      margin-top: 10px;
+      font-size: 1rem;
+      color: #888;
+    }
+    #ledState.on { color: #facc15; }
+    .comandos {
+      margin-top: 30px;
+      font-size: 0.85rem;
+      color: #666;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>🎙️ Control por Voz</h1>
+  <div class="sub">Decí "encender" o "apagar" para controlar el LED</div>
+
+  <button id="connectBtn" class="btn btn-connect">Conectar ESP32</button>
+  <div id="status">Desconectado</div>
+
+  <button id="micBtn" class="btn-mic" disabled>🎤</button>
+  <div id="transcript">&nbsp;</div>
+  <div id="ledState">LED: desconocido</div>
+
+  <div class="comandos">
+    Comandos reconocidos: <b>"encender"</b> / <b>"apagar"</b><br>
+    Funciona solo en Chrome/Edge para Android (no en Safari/iOS)
+  </div>
+
+  <script>
+    // ⚠️ Debe coincidir con los bloques "Inicializar BLE como", "Crear servicio BLE"
+    // y "Crear característica" configurados en el editor de bloques del ESP32.
+    const urlParams = new URLSearchParams(window.location.search);
+    const BLE_DEVICE_NAME_PREFIX = urlParams.get('nombre') || 'ESP32-BLE';
+    const SERVICE_UUID = 0x181A;
+    const TX_CHARACTERISTIC_UUID = 0x2A6E;
+
+    let deviceBLE = null;
+    let txCharacteristic = null;
+
+    const connectBtn = document.getElementById('connectBtn');
+    const statusText = document.getElementById('status');
+    const micBtn = document.getElementById('micBtn');
+    const transcriptDiv = document.getElementById('transcript');
+    const ledStateDiv = document.getElementById('ledState');
+
+    statusText.innerText = 'Buscando: ' + BLE_DEVICE_NAME_PREFIX + (BLE_DEVICE_NAME_PREFIX === 'ESP32-BLE' ? ' (cualquiera)' : '');
+
+    // ---- Conexión BLE (misma lógica que el control del carro) ----
+    connectBtn.addEventListener('click', async () => {
+      if (deviceBLE && deviceBLE.gatt.connected) {
+        deviceBLE.gatt.disconnect();
+        return;
+      }
+
+      if (!navigator.bluetooth) {
+        statusText.innerText = 'Este navegador no soporta Web Bluetooth (usa Chrome/Edge, y HTTPS o localhost).';
+        return;
+      }
+
+      try {
+        statusText.innerText = 'Buscando ESP32...';
+        deviceBLE = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: BLE_DEVICE_NAME_PREFIX }],
+          optionalServices: [SERVICE_UUID]
+        });
+
+        statusText.innerText = 'Conectando...';
+        const server = await deviceBLE.gatt.connect();
+
+        statusText.innerText = 'Obteniendo servicios...';
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        txCharacteristic = await service.getCharacteristic(TX_CHARACTERISTIC_UUID);
+
+        statusText.innerText = '¡Conectado!';
+        connectBtn.innerText = 'Desconectar';
+        connectBtn.classList.add('connected');
+        micBtn.disabled = false;
+
+        deviceBLE.addEventListener('gattserverdisconnected', onDisconnected);
+      } catch (error) {
+        console.error(error);
+        statusText.innerText = 'Error de conexión: ' + error.message;
+      }
+    });
+
+    function onDisconnected() {
+      statusText.innerText = 'Desconectado';
+      connectBtn.innerText = 'Conectar ESP32';
+      connectBtn.classList.remove('connected');
+      txCharacteristic = null;
+      micBtn.disabled = true;
+      stopListening();
+    }
+
+    async function sendCmd(command) {
+      if (!txCharacteristic) return;
+      try {
+        const encoder = new TextEncoder();
+        await txCharacteristic.writeValue(encoder.encode(command));
+        console.log('Enviado: ' + command);
+      } catch (error) {
+        console.error('Error enviando comando: ', error);
+      }
+    }
+
+    // ---- Reconocimiento de voz (Web Speech API) ----
+    const SpeechRecognitionClass = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let recognition = null;
+    let listening = false;
+    let shouldKeepListening = false; // controla el reinicio automático
+
+    if (!SpeechRecognitionClass) {
+      micBtn.disabled = true;
+      transcriptDiv.innerText = 'Este navegador no soporta reconocimiento de voz.';
+    } else {
+      recognition = new SpeechRecognitionClass();
+      recognition.lang = 'es-VE'; // español (cambia a 'es-ES', 'es-MX', etc. si prefieres otro acento
+      recognition.continuous = false;   // procesamos una frase a la vez
+      recognition.interimResults = true; // muestra lo que va reconociendo en vivo, no solo al final
+
+      recognition.onresult = (event) => {
+        let text = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          text += event.results[i][0].transcript;
+        }
+        transcriptDiv.innerText = '"' + text + '"';
+
+        // Solo actuamos sobre resultados FINALES (no sobre lo que todavía está a mitad de reconocer)
+        const isFinal = event.results[event.results.length - 1].isFinal;
+        if (isFinal) {
+          procesarComando(text.toLowerCase());
+        }
+      };
+
+      recognition.onerror = (event) => {
+        console.error('Error de reconocimiento:', event.error);
+        if (event.error === 'no-speech') {
+          // No dijo nada a tiempo; no es un error grave, seguimos escuchando si corresponde.
+          return;
+        }
+        transcriptDiv.innerText = 'Error: ' + event.error;
+      };
+
+      recognition.onend = () => {
+        listening = false;
+        micBtn.classList.remove('listening');
+        // El reconocimiento de Chrome se corta solo tras un silencio o una frase.
+        // Si el usuario sigue queriendo "escucha continua", lo reiniciamos automáticamente.
+        if (shouldKeepListening) {
+          try { recognition.start(); listening = true; micBtn.classList.add('listening'); }
+          catch (e) { /* ya estaba iniciado, se ignora */ }
+        }
+      };
+    }
+
+    function procesarComando(texto) {
+      if (texto.includes('encender')) {
+        sendCmd('ON');
+        ledStateDiv.innerText = 'LED: encendido';
+        ledStateDiv.classList.add('on');
+      } else if (texto.includes('apagar')) {
+        sendCmd('OFF');
+        ledStateDiv.innerText = 'LED: apagado';
+        ledStateDiv.classList.remove('on');
+      }
+      // Si no reconoce ninguna de las dos palabras, no se envía nada — se ignora
+      // en vez de mandar un comando equivocado.
+    }
+
+    function stopListening() {
+      shouldKeepListening = false;
+      if (recognition && listening) {
+        recognition.stop();
+      }
+      micBtn.classList.remove('listening');
+    }
+
+    micBtn.addEventListener('click', () => {
+      if (!recognition) return;
+      if (listening) {
+        stopListening();
+      } else {
+        shouldKeepListening = true;
+        try {
+          recognition.start();
+          listening = true;
+          micBtn.classList.add('listening');
+          transcriptDiv.innerText = 'Escuchando...';
+        } catch (e) {
+          console.error(e);
+        }
+      }
+    });
+  </script>
+</body>
+</html>
